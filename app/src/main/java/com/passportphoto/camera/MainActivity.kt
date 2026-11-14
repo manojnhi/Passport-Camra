@@ -109,8 +109,9 @@ class MainActivity : ComponentActivity() {
     private var key = ""
     private var sentCount = 0
 
-    private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) startCamera() else say("Camera permission is needed. Please allow it in the phone Settings.", "#fb7185")
+    private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { res ->
+        if (res[Manifest.permission.CAMERA] == true || ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+        else say("Camera permission is needed. Please allow it in the phone Settings.", "#fb7185")
     }
 
     private val pickLauncher = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
@@ -336,10 +337,18 @@ class MainActivity : ComponentActivity() {
             }
         })
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+        val needed = ArrayList<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.CAMERA)
+        }
+        if (android.os.Build.VERSION.SDK_INT < 29 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            needed.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        }
+        if (needed.isEmpty()) {
             startCamera()
         } else {
-            permLauncher.launch(Manifest.permission.CAMERA)
+            permLauncher.launch(needed.toTypedArray())
         }
     }
 
@@ -414,7 +423,9 @@ class MainActivity : ComponentActivity() {
         val v = ContentValues()
         v.put(MediaStore.Images.Media.DISPLAY_NAME, "passport_" + System.currentTimeMillis() + ".jpg")
         v.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-        v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PassportCamera")
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            v.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PassportCamera")
+        }
         val opts = ImageCapture.OutputFileOptions.Builder(
             contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v
         ).build()
