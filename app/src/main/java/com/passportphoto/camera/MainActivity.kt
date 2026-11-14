@@ -3,6 +3,7 @@ package com.passportphoto.camera
 import android.Manifest
 import android.app.AlertDialog
 import android.content.ContentValues
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
@@ -15,10 +16,10 @@ import android.graphics.Paint
 import android.graphics.drawable.GradientDrawable
 import android.media.ExifInterface
 import android.media.MediaActionSound
-import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Bundle
 import android.provider.MediaStore
+import android.util.Base64
 import android.view.GestureDetector
 import android.view.Gravity
 import android.view.MotionEvent
@@ -44,13 +45,23 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.io.ByteArrayOutputStream
+import java.math.BigInteger
 import java.net.HttpURLConnection
-import java.net.Inet4Address
-import java.net.InetSocketAddress
-import java.net.Socket
 import java.net.URL
-import java.util.concurrent.Callable
+import java.security.AlgorithmParameters
+import java.security.KeyFactory
+import java.security.KeyPairGenerator
+import java.security.SecureRandom
+import java.security.interfaces.ECPublicKey
+import java.security.spec.ECGenParameterSpec
+import java.security.spec.ECParameterSpec
+import java.security.spec.ECPoint
+import java.security.spec.ECPublicKeySpec
 import java.util.concurrent.Executors
+import javax.crypto.Cipher
+import javax.crypto.KeyAgreement
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 internal class GridView(c: Context) : View(c) {
     private val p = Paint()
@@ -73,7 +84,7 @@ internal class GridView(c: Context) : View(c) {
 class MainActivity : ComponentActivity() {
 
     companion object {
-        const val PORT = 8766
+        const val RELAY = "https://ntfy.sh"
     }
 
     private lateinit var prefs: SharedPreferences
@@ -94,15 +105,16 @@ class MainActivity : ComponentActivity() {
     private var useBack = true
     private var flashMode = ImageCapture.FLASH_MODE_OFF
     private var capturing = false
-    private var host = ""
-    private var token = ""
+    private var topic = ""
+    private var key = ""
     private var sentCount = 0
 
-    @Volatile private var busy = false
-    @Volatile private var connected = false
-
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { ok ->
-        if (ok) startCamera() else say("Camera ki permission chahiye. Phone Settings mein allow karein.", "#fb7185")
+        if (ok) startCamera() else say("Camera permission is needed. Please allow it in the phone Settings.", "#fb7185")
+    }
+
+    private val pickLauncher = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        if (uris.isNotEmpty()) uploadPicked(uris)
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
@@ -136,8 +148,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences("pb", Context.MODE_PRIVATE)
-        host = prefs.getString("host", "") ?: ""
-        token = prefs.getString("token", "") ?: ""
+        topic = prefs.getString("topic", "") ?: ""
+        key = prefs.getString("key", "") ?: ""
 
         val match = ViewGroup.LayoutParams.MATCH_PARENT
         val wrap = ViewGroup.LayoutParams.WRAP_CONTENT
@@ -243,6 +255,13 @@ class MainActivity : ComponentActivity() {
         lpF.rightMargin = dp(28)
         root.addView(flip, lpF)
 
+        val gal = pill("\uD83D\uDDBC Gallery")
+        gal.setOnClickListener { pickLauncher.launch("image/*") }
+        val lpG = FrameLayout.LayoutParams(wrap, wrap, Gravity.BOTTOM or Gravity.START)
+        lpG.bottomMargin = dp(60)
+        lpG.leftMargin = dp(28)
+        root.addView(gal, lpG)
+
         // ---- settings panel ----
         settingsPanel = LinearLayout(this)
         settingsPanel.orientation = LinearLayout.VERTICAL
@@ -263,38 +282,40 @@ class MainActivity : ComponentActivity() {
         setStatus.setPadding(0, dp(10), 0, dp(14))
         settingsPanel.addView(setStatus)
 
-        val find = Button(this)
-        find.text = "PC dobara dhoondho"
-        find.setOnClickListener {
-            connected = false
-            connect()
-        }
-        settingsPanel.addView(find, LinearLayout.LayoutParams(match, dp(50)))
+        val paste = Button(this)
+        paste.text = "Paste QR link"
+        paste.setOnClickListener { linkDialog() }
+        settingsPanel.addView(paste, LinearLayout.LayoutParams(match, dp(50)))
 
-        val manual = Button(this)
-        manual.text = "IP / link khud daalein"
-        manual.setOnClickListener { manualDialog() }
+        val unlink = Button(this)
+        unlink.text = "Unlink shop QR"
+        unlink.setOnClickListener {
+            topic = ""
+            key = ""
+            prefs.edit().remove("topic").remove("key").apply()
+            refreshStatus()
+        }
         val lpM = LinearLayout.LayoutParams(match, dp(50))
         lpM.topMargin = dp(8)
-        settingsPanel.addView(manual, lpM)
+        settingsPanel.addView(unlink, lpM)
 
         val lpC = LinearLayout.LayoutParams(wrap, wrap)
         lpC.topMargin = dp(14)
-        settingsPanel.addView(check("Photo PC par apne aap bhejein", "auto", true) { }, lpC)
-        settingsPanel.addView(check("Photo phone ki gallery mein bhi rakhein", "keep", false) { }, lpC)
-        settingsPanel.addView(check("Grid dikhayein", "grid", true) { on ->
+        settingsPanel.addView(check("Send photo to the shop automatically", "auto", true) { }, lpC)
+        settingsPanel.addView(check("Also keep the photo in the phone gallery", "keep", false) { }, lpC)
+        settingsPanel.addView(check("Show grid", "grid", true) { on ->
             grid.visibility = if (on) View.VISIBLE else View.GONE
         }, lpC)
 
         val hint = TextView(this)
-        hint.text = "Pehli baar jodne ke liye: PC par Passport Photo tool mein Mobile icon dabayein, phir yahan 'PC dobara dhoondho' dabayein."
+        hint.text = "First time: on the shop PC open the QR window and tap 'Copy link'. Send that link to this phone (for example by WhatsApp), copy it here, then tap 'Paste QR link'. After that it works on any network, including mobile data."
         hint.textSize = 12f
         hint.setTextColor(Color.parseColor("#9fb3cf"))
         hint.setPadding(0, dp(18), 0, dp(18))
         settingsPanel.addView(hint)
 
         val close = Button(this)
-        close.text = "Band karein"
+        close.text = "Close"
         close.setTextColor(Color.WHITE)
         close.setBackgroundColor(Color.parseColor("#2269e8"))
         close.setOnClickListener { showSettings(false) }
@@ -324,7 +345,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        if (!connected && !busy) connect()
+        refreshStatus()
     }
 
     private fun showSettings(show: Boolean) {
@@ -364,7 +385,7 @@ class MainActivity : ComponentActivity() {
             camera = provider.bindToLifecycle(this, selector, preview, capture)
             imageCapture = capture
         } catch (e: Exception) {
-            say("Camera nahi khul paya: " + e.message, "#fb7185")
+            say("Could not open the camera: " + e.message, "#fb7185")
         }
     }
 
@@ -403,150 +424,72 @@ class MainActivity : ComponentActivity() {
                 capturing = false
                 val uri = output.savedUri
                 if (uri == null) {
-                    say("Photo save nahi hui.", "#fb7185")
+                    say("The photo was not saved.", "#fb7185")
                     return
                 }
                 if (prefs.getBoolean("auto", true)) {
                     upload(uri)
                 } else {
-                    say("Photo gallery mein save ho gayi.", "#4ade80")
+                    say("Photo saved in the gallery.", "#4ade80")
                 }
             }
 
             override fun onError(exc: ImageCaptureException) {
                 capturing = false
-                say("Photo nahi khinchi: " + exc.message, "#fb7185")
+                say("Could not take the photo: " + exc.message, "#fb7185")
             }
         })
     }
 
-    // ---------------- finding the PC ----------------
+    // ---------------- shop QR link (works on any network) ----------------
 
-    private fun connect() {
-        if (busy) return
-        busy = true
-        say("PC dhoondh raha hu...", "#7dd3fc")
-        io.execute {
-            try {
-                var h = host
-                if (h.isEmpty() || !hello(h)) {
-                    h = scan() ?: ""
-                }
-                if (h.isEmpty()) {
-                    say("PC nahi mila. PC par bridge chalu karein (tool mein Mobile icon dabayein) aur phone-PC ek hi WiFi par rakhein.", "#fb7185")
-                    return@execute
-                }
-                host = h
-                prefs.edit().putString("host", h).apply()
-                if (token.isEmpty()) {
-                    val t = pair(h)
-                    if (t == null) {
-                        say("Pehli baar jodne ke liye PC par tool mein Mobile icon dabayein, phir Settings mein 'PC dobara dhoondho' dabayein.", "#fbbf24")
-                        return@execute
-                    }
-                    token = t
-                    prefs.edit().putString("token", t).apply()
-                }
-                connected = true
-                say("\u25CF PC se juda hua ($h)", "#4ade80")
-            } finally {
-                busy = false
-            }
-        }
-    }
-
-    private fun localIpv4(): String? {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val net = cm.activeNetwork ?: return null
-        val lp = cm.getLinkProperties(net) ?: return null
-        for (la in lp.linkAddresses) {
-            val a = la.address
-            if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
-        }
-        return null
-    }
-
-    private fun portOpen(h: String): Boolean {
+    private fun b64uDecode(s: String): ByteArray? {
         return try {
-            Socket().use { it.connect(InetSocketAddress(h, PORT), 350) }
-            true
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private fun hello(h: String): Boolean {
-        return try {
-            val c = URL("http://$h:$PORT/hello").openConnection() as HttpURLConnection
-            c.connectTimeout = 700
-            c.readTimeout = 1200
-            val ok = c.responseCode == 200 && c.inputStream.bufferedReader().use { it.readText() }.contains("phonebridge")
-            c.disconnect()
-            ok
-        } catch (e: Exception) {
-            false
-        }
-    }
-
-    private fun scan(): String? {
-        val ip = localIpv4() ?: return null
-        val prefix = ip.substringBeforeLast('.')
-        val pool = Executors.newFixedThreadPool(48)
-        try {
-            val tasks = (1..254).map { i ->
-                Callable<String?> {
-                    val cand = "$prefix.$i"
-                    if (cand != ip && portOpen(cand) && hello(cand)) cand else null
-                }
-            }
-            for (f in pool.invokeAll(tasks)) {
-                val r = f.get()
-                if (r != null) return r
-            }
-            return null
-        } finally {
-            pool.shutdownNow()
-        }
-    }
-
-    private fun pair(h: String): String? {
-        return try {
-            val c = URL("http://$h:$PORT/pair").openConnection() as HttpURLConnection
-            c.connectTimeout = 2000
-            c.readTimeout = 3000
-            if (c.responseCode != 200) {
-                c.disconnect()
-                null
-            } else {
-                val body = c.inputStream.bufferedReader().use { it.readText() }
-                c.disconnect()
-                Regex("\"token\"\\s*:\\s*\"([0-9a-f]+)\"").find(body)?.groupValues?.get(1)
-            }
+            Base64.decode(s, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
         } catch (e: Exception) {
             null
         }
     }
 
-    private fun manualDialog() {
+    // The QR link looks like  https://.../sender.html#t=<topic>&k=<public key>
+    private fun parseLink(text: String): Pair<String, String>? {
+        val t = Regex("[#&?]t=([A-Za-z0-9_-]{8,64})").find(text)?.groupValues?.get(1) ?: return null
+        val k = Regex("[#&]k=([A-Za-z0-9_-]+)").find(text)?.groupValues?.get(1) ?: return null
+        val raw = b64uDecode(k) ?: return null
+        if (raw.size != 65 || raw[0].toInt() != 4) return null
+        return Pair(t, k)
+    }
+
+    private fun refreshStatus() {
+        if (topic.isNotEmpty() && key.isNotEmpty()) {
+            say("\u25CF Linked to the shop QR (works on any network)", "#4ade80")
+        } else {
+            say("Not linked yet. Open Settings and tap 'Paste QR link'.", "#fbbf24")
+        }
+    }
+
+    private fun linkDialog() {
         val et = EditText(this)
-        et.hint = "192.168.1.5  ya poora link"
+        et.hint = "https://.../sender.html#t=...&k=..."
         et.setSingleLine()
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString() ?: ""
+            if (parseLink(clip) != null) et.setText(clip)
+        } catch (e: Exception) {
+        }
         AlertDialog.Builder(this)
-            .setTitle("PC ka IP ya link")
+            .setTitle("Shop QR link")
             .setView(et)
             .setPositiveButton("Save") { _, _ ->
-                val t = et.text.toString().trim()
-                val h = t.substringAfter("://").substringBefore('/').substringBefore('?').substringBefore(':')
-                val tk = Regex("[?&]t=([0-9a-f]+)").find(t)?.groupValues?.get(1)
-                if (h.isNotEmpty()) {
-                    host = h
-                    prefs.edit().putString("host", h).apply()
-                    if (tk != null) {
-                        token = tk
-                        prefs.edit().putString("token", tk).apply()
-                    }
-                    connected = false
-                    connect()
+                val p = parseLink(et.text.toString().trim())
+                if (p == null) {
+                    say("That link is not valid. Use 'Copy link' in the QR window on the shop PC.", "#fb7185")
+                } else {
+                    topic = p.first
+                    key = p.second
+                    prefs.edit().putString("topic", topic).putString("key", key).apply()
+                    refreshStatus()
                 }
             }
             .setNegativeButton("Cancel", null)
@@ -556,39 +499,119 @@ class MainActivity : ComponentActivity() {
     // ---------------- upload ----------------
 
     private fun upload(uri: Uri) {
-        if (host.isEmpty() || token.isEmpty()) {
-            say("PC se nahi juda. Photo gallery mein save hai. Settings mein 'PC dobara dhoondho' dabayein.", "#fbbf24")
+        if (topic.isEmpty() || key.isEmpty()) {
+            say("Not linked to the shop. The photo is saved in the gallery. Open Settings and tap 'Paste QR link'.", "#fbbf24")
             return
         }
-        say("Photo bhej raha hu...", "#7dd3fc")
+        say("Locking and sending the photo...", "#7dd3fc")
         io.execute {
             try {
-                val bytes = prepare(uri)
-                var code = post(bytes)
-                if (code == 403) {
-                    val t = pair(host)
-                    if (t != null) {
-                        token = t
-                        prefs.edit().putString("token", t).apply()
-                        code = post(bytes)
-                    }
-                }
-                if (code == 200) {
+                val sealed = seal(prepare(uri))
+                val code = put(sealed)
+                if (code in 200..299) {
                     sentCount++
-                    say("\u2713 Photo PC par pahunch gayi (" + sentCount + ")", "#4ade80")
+                    say("\u2713 Photo sent to the shop (" + sentCount + ")", "#4ade80")
                     if (!prefs.getBoolean("keep", false)) {
                         try { contentResolver.delete(uri, null, null) } catch (e: Exception) { }
                     }
-                } else if (code == 403) {
-                    say("Link badal gaya hai. PC par tool mein Mobile icon dabayein, phir dobara photo khinchein. (Photo gallery mein hai)", "#fbbf24")
+                } else if (code == 413) {
+                    say("The photo is too large to send. It is saved in the gallery.", "#fb7185")
+                } else if (code == 429) {
+                    say("Too many uploads. Wait a minute and try again. (Photo is in the gallery)", "#fbbf24")
                 } else {
-                    say("Bhej nahi paya (code $code). Photo gallery mein hai.", "#fb7185")
+                    say("Could not send (code $code). The photo is saved in the gallery.", "#fb7185")
                 }
             } catch (e: Exception) {
-                connected = false
-                say("PC se connection toot gaya. Settings mein 'PC dobara dhoondho' dabayein. (Photo gallery mein hai)", "#fb7185")
+                say("No internet connection. The photo is saved in the gallery.", "#fb7185")
             }
         }
+    }
+
+    // Photos picked from the phone gallery: sent to the shop, the originals are never deleted.
+    private fun uploadPicked(uris: List<Uri>) {
+        if (topic.isEmpty() || key.isEmpty()) {
+            say("Not linked to the shop. Open Settings and tap 'Paste QR link'.", "#fbbf24")
+            return
+        }
+        io.execute {
+            var ok = 0
+            var lastCode = 0
+            for ((i, u) in uris.withIndex()) {
+                say("Locking and sending photo " + (i + 1) + " of " + uris.size + "...", "#7dd3fc")
+                try {
+                    val code = put(seal(prepare(u)))
+                    lastCode = code
+                    if (code in 200..299) {
+                        ok++
+                    } else if (code == 429) {
+                        break
+                    }
+                } catch (e: Exception) {
+                    lastCode = -1
+                }
+            }
+            sentCount += ok
+            if (ok == uris.size) {
+                say("\u2713 " + ok + " photo(s) sent to the shop", "#4ade80")
+            } else if (lastCode == 429) {
+                say("Too many uploads. " + ok + " of " + uris.size + " sent. Wait a minute and send the rest again.", "#fbbf24")
+            } else if (lastCode == -1) {
+                say(ok.toString() + " of " + uris.size + " sent. No internet connection or the photo could not be read.", "#fb7185")
+            } else {
+                say(ok.toString() + " of " + uris.size + " sent (code " + lastCode + "). Please try again.", "#fb7185")
+            }
+        }
+    }
+
+    private fun fixed32(v: BigInteger): ByteArray {
+        val b = v.toByteArray()
+        val out = ByteArray(32)
+        if (b.size >= 32) {
+            System.arraycopy(b, b.size - 32, out, 0, 32)
+        } else {
+            System.arraycopy(b, 0, out, 32 - b.size, b.size)
+        }
+        return out
+    }
+
+    // Same format as the sender web page (v1): [1][ephemeral public key 65][iv 12][AES-GCM ciphertext]
+    // ECDH (P-256) + AES-256-GCM, the ephemeral public key is also the authenticated data.
+    private fun seal(jpeg: ByteArray): ByteArray {
+        val pcRaw = b64uDecode(key) ?: throw IllegalStateException("bad key")
+        val ap = AlgorithmParameters.getInstance("EC")
+        ap.init(ECGenParameterSpec("secp256r1"))
+        val spec = ap.getParameterSpec(ECParameterSpec::class.java)
+        val x = BigInteger(1, pcRaw.copyOfRange(1, 33))
+        val y = BigInteger(1, pcRaw.copyOfRange(33, 65))
+        val pcPub = KeyFactory.getInstance("EC").generatePublic(ECPublicKeySpec(ECPoint(x, y), spec))
+
+        val kpg = KeyPairGenerator.getInstance("EC")
+        kpg.initialize(ECGenParameterSpec("secp256r1"))
+        val eph = kpg.generateKeyPair()
+        val ephPub = eph.public as ECPublicKey
+        val ephRaw = ByteArray(65)
+        ephRaw[0] = 4
+        System.arraycopy(fixed32(ephPub.w.affineX), 0, ephRaw, 1, 32)
+        System.arraycopy(fixed32(ephPub.w.affineY), 0, ephRaw, 33, 32)
+
+        val ka = KeyAgreement.getInstance("ECDH")
+        ka.init(eph.private)
+        ka.doPhase(pcPub, true)
+        val secret = ka.generateSecret()
+
+        val iv = ByteArray(12)
+        SecureRandom().nextBytes(iv)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(secret, "AES"), GCMParameterSpec(128, iv))
+        cipher.updateAAD(ephRaw)
+        val ct = cipher.doFinal(jpeg)
+
+        val out = ByteArray(1 + 65 + 12 + ct.size)
+        out[0] = 1
+        System.arraycopy(ephRaw, 0, out, 1, 65)
+        System.arraycopy(iv, 0, out, 66, 12)
+        System.arraycopy(ct, 0, out, 78, ct.size)
+        return out
     }
 
     private fun prepare(uri: Uri): ByteArray {
@@ -624,13 +647,15 @@ class MainActivity : ComponentActivity() {
         return out.toByteArray()
     }
 
-    private fun post(bytes: ByteArray): Int {
-        val c = URL("http://$host:$PORT/upload?t=$token").openConnection() as HttpURLConnection
-        c.requestMethod = "POST"
+    // Upload to the free relay (ntfy.sh). The tag lets the shop's Passport tool pick it up (documents are tagged "doc").
+    private fun put(bytes: ByteArray): Int {
+        val c = URL("$RELAY/$topic").openConnection() as HttpURLConnection
+        c.requestMethod = "PUT"
         c.doOutput = true
-        c.connectTimeout = 3000
-        c.readTimeout = 30000
-        c.setRequestProperty("Content-Type", "image/jpeg")
+        c.connectTimeout = 10000
+        c.readTimeout = 60000
+        c.setRequestProperty("Content-Type", "application/octet-stream")
+        c.setRequestProperty("Tags", "photo")
         c.setFixedLengthStreamingMode(bytes.size)
         c.outputStream.use { it.write(bytes) }
         val code = c.responseCode
